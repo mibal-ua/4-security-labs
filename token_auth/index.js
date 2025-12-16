@@ -4,7 +4,6 @@ const onFinished = require('on-finished');
 const bodyParser = require('body-parser');
 const path = require('path');
 const fs = require('fs');
-const {EncryptJWT, jwtDecrypt} = require('jose');
 
 const jwt = require('jsonwebtoken');
 const jwksClient = require('jwks-rsa');
@@ -17,19 +16,6 @@ const app = express();
 const client = jwksClient({
     jwksUri: `https://${process.env.AUTH0_DOMAIN}/.well-known/jwks.json`
 });
-
-const secret = Buffer.from(process.env.JWT_ENC_SECRET, 'base64');
-
-const encryptToken = async (payload, ttl = '1h') => new EncryptJWT(payload)
-    .setProtectedHeader({alg: 'dir', enc: 'A256GCM'})
-    .setIssuedAt()
-    .setExpirationTime(ttl)
-    .encrypt(secret);
-
-const decryptToken = async (jweToken) => {
-    const {payload} = await jwtDecrypt(jweToken, secret);
-    return payload;
-};
 
 const getKey = (header, callback) => {
     client.getSigningKey(header.kid, (err, key) => {
@@ -58,40 +44,6 @@ const checkJwt = (req, res, next) => {
         req.user = decoded;
         next();
     });
-};
-
-const checkJwe = async (req, res, next) => {
-    const jwe = req.session.access_token;
-    if (!jwe) return res.status(401).json({error: 'No token found'});
-
-    try {
-        const payload = await decryptToken(jwe);
-
-        const accessToken = payload.access_token;
-        if (!accessToken) {
-            return res.status(401).json({error: 'No access_token in payload'});
-        }
-
-        jwt.verify(accessToken, getKey, {
-            audience: process.env.AUTH0_AUDIENCE,
-            issuer: `https://${process.env.AUTH0_DOMAIN}/`,
-            algorithms: ['RS256']
-        }, (err, decoded) => {
-            if (err) {
-                console.error('JWT verification error:', err);
-                return res.status(401).json({error: 'Invalid access_token'});
-            }
-
-            req.user = decoded;
-            req.tokenPayload = payload;
-
-            next();
-        });
-
-    } catch (err) {
-        console.error('JWE decryption error:', err);
-        return res.status(401).json({error: 'Invalid or expired JWE'});
-    }
 };
 
 app.use(bodyParser.json());
@@ -182,67 +134,48 @@ app.get('/logout', (req, res) => {
     res.redirect('/');
 });
 
-app.get('/login', (req, res) => {
-    const authorizeUrl = `https://${process.env.AUTH0_DOMAIN}/authorize?` +
-        new URLSearchParams({
-            response_type: 'code',
-            client_id: process.env.AUTH0_CLIENT_ID,
-            redirect_uri: process.env.AUTH0_CALLBACK_URL,
-            scope: 'openid profile email offline_access',
-            audience: process.env.AUTH0_AUDIENCE
-        });
-
-    console.log('Redirecting to:', authorizeUrl);
-    res.redirect(authorizeUrl);
-});
-
-app.get('/callback', async (req, res) => {
-    const { code } = req.query;
-    if (!code) {
-        return res.status(400).json({ error: 'Authorization code not provided' });
-    }
+app.post('/api/login', async (req, res) => {
+    const {login, password} = req.body;
 
     try {
         const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            headers: {'content-type': 'application/json'},
             body: JSON.stringify({
-                grant_type: 'authorization_code',
+                grant_type: 'http://auth0.com/oauth/grant-type/password-realm',
+                username: login,
+                password: password,
                 client_id: process.env.AUTH0_CLIENT_ID,
                 client_secret: process.env.AUTH0_CLIENT_SECRET,
-                code,
-                redirect_uri: process.env.AUTH0_CALLBACK_URL
+                realm: process.env.AUTH0_REALM,
+                scope: 'openid profile email offline_access',
+                audience: process.env.AUTH0_AUDIENCE
             })
         });
 
+        if (!response.ok) return res.status(401).json({error: 'Invalid credentials'});
+
         const data = await response.json();
+        const {access_token, id_token, refresh_token, expires_in} = data;
 
-        if (data.error) {
-            console.error("Token exchange error:", data);
-            return res.status(400).json(data);
-        }
-
-        const { access_token, id_token, refresh_token, expires_in } = data;
-
-        const decoded = jwt.decode(id_token);
-
-        req.session.username = decoded.email || decoded.name || decoded.sub;
+        req.session.username = login;
         req.session.access_token = access_token;
         req.session.refresh_token = refresh_token;
         req.session.expires_at = Date.now() + expires_in * 1000;
         req.session.issued_at = Date.now();
 
         res.json({
-            message: 'Login successful via Auth0 SSO',
-            user: decoded,
+            message: 'Login successful',
             sessionId: req.sessionId,
+            username: login,
             token: access_token,
-            refresh_token
+            refresh_token,
+            id_token
         });
 
-    } catch (err) {
-        console.error('Callback error:', err);
-        res.status(500).json({ error: 'Failed to exchange code' });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({error: 'Internal server error'});
     }
 });
 
@@ -290,20 +223,20 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-app.get('/api/check-token', checkJwe, async (req, res) => {
+app.get('/api/check-token', checkJwt, async (req, res) => {
     const session = req.session;
 
     if (!session.access_token) {
         return res.status(401).json({error: 'Not logged in'});
     }
 
-    try {
-        const payload = await decryptToken(session.access_token);
-        let {access_token, refresh_token, exp, username, sub, email, name} = payload;
+    const age = Date.now() - (session.issued_at || 0);
 
-        let expiresIn = (payload.expires_at || exp * 1000) - Date.now();
+    const expiresIn = session.expires_at - Date.now();
 
-        if (expiresIn < 60 * 1000) {
+    //if (age > 10 * 1000)
+    if (expiresIn < 60 * 1000) {
+        try {
             const refreshResp = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
                 method: 'POST',
                 headers: {'content-type': 'application/json'},
@@ -318,51 +251,43 @@ app.get('/api/check-token', checkJwe, async (req, res) => {
             const data = await refreshResp.json();
 
             if (data.access_token) {
-                access_token = data.access_token;
-                expiresIn = data.expires_in * 1000;
-
-                const newPayload = {
-                    ...payload,
-                    access_token,
-                    expires_at: Date.now() + expiresIn,
-                };
-
-                const newJwe = await encryptToken(newPayload, '1h');
-
-                session.access_token = newJwe;
-                session.expires_at = newPayload.expires_at;
+                session.access_token = data.access_token;
+                session.expires_at = Date.now() + data.expires_in * 1000;
                 sessions.set(req.sessionId, session);
 
                 return res.json({
-                    message: 'Token refreshed (and encrypted as JWE)',
-                    token: newJwe,
-                    user: {sub, email, name, username},
+                    message: 'Token refreshed',
+                    token: session.access_token,
+                    user: req.user,
                 });
+            } else {
+                return res.status(401).json({error: 'Failed to refresh token'});
             }
+
+        } catch (e) {
+            console.error('Refresh error:', e);
+            return res.status(500).json({error: 'Internal server error'});
         }
-
-        res.json({
-            message: 'Token is valid and signature verified',
-            token: session.access_token,
-            expires_in: Math.floor(expiresIn / 1000),
-            user: payload,
-        });
-
-    } catch (err) {
-        console.error('JWE decryption error:', err);
-        return res.status(401).json({error: 'Invalid or expired JWE'});
     }
+
+    res.json({
+        message: 'Token is valid and signature verified',
+        token: session.access_token,
+        expires_in: expiresIn / 1000,
+        user: req.user,
+    });
 });
+
 app.post('/debug/set-token', (req, res) => {
-    const {token} = req.body;
-    if (!token) return res.status(400).json({error: 'Provide token in body'});
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'Provide token in body' });
 
     req.session.access_token = token;
     req.session.issued_at = Date.now();
     req.session.expires_at = Date.now() + 60 * 1000;
 
     sessions.set(req.sessionId, req.session);
-    res.json({message: 'Token set for testing', sessionId: req.sessionId});
+    res.json({ message: 'Token set for testing', sessionId: req.sessionId });
 });
 
 
