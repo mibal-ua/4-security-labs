@@ -60,6 +60,40 @@ const checkJwt = (req, res, next) => {
     });
 };
 
+const checkJwe = async (req, res, next) => {
+    const jwe = req.session.access_token;
+    if (!jwe) return res.status(401).json({error: 'No token found'});
+
+    try {
+        const payload = await decryptToken(jwe);
+
+        const accessToken = payload.access_token;
+        if (!accessToken) {
+            return res.status(401).json({error: 'No access_token in payload'});
+        }
+
+        jwt.verify(accessToken, getKey, {
+            audience: process.env.AUTH0_AUDIENCE,
+            issuer: `https://${process.env.AUTH0_DOMAIN}/`,
+            algorithms: ['RS256']
+        }, (err, decoded) => {
+            if (err) {
+                console.error('JWT verification error:', err);
+                return res.status(401).json({error: 'Invalid access_token'});
+            }
+
+            req.user = decoded;
+            req.tokenPayload = payload;
+
+            next();
+        });
+
+    } catch (err) {
+        console.error('JWE decryption error:', err);
+        return res.status(401).json({error: 'Invalid or expired JWE'});
+    }
+};
+
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({extended: true}));
 
@@ -148,55 +182,67 @@ app.get('/logout', (req, res) => {
     res.redirect('/');
 });
 
-app.post('/api/login', async (req, res) => {
-    const {login, password} = req.body;
+app.get('/login', (req, res) => {
+    const authorizeUrl = `https://${process.env.AUTH0_DOMAIN}/authorize?` +
+        new URLSearchParams({
+            response_type: 'code',
+            client_id: process.env.AUTH0_CLIENT_ID,
+            redirect_uri: process.env.AUTH0_CALLBACK_URL,
+            scope: 'openid profile email offline_access',
+            audience: process.env.AUTH0_AUDIENCE
+        });
+
+    console.log('Redirecting to:', authorizeUrl);
+    res.redirect(authorizeUrl);
+});
+
+app.get('/callback', async (req, res) => {
+    const { code } = req.query;
+    if (!code) {
+        return res.status(400).json({ error: 'Authorization code not provided' });
+    }
 
     try {
         const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
             method: 'POST',
-            headers: {'content-type': 'application/json'},
+            headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
-                grant_type: 'http://auth0.com/oauth/grant-type/password-realm',
-                username: login,
-                password: password,
+                grant_type: 'authorization_code',
                 client_id: process.env.AUTH0_CLIENT_ID,
                 client_secret: process.env.AUTH0_CLIENT_SECRET,
-                realm: process.env.AUTH0_REALM,
-                scope: 'openid profile email offline_access',
-                audience: process.env.AUTH0_AUDIENCE
+                code,
+                redirect_uri: process.env.AUTH0_CALLBACK_URL
             })
         });
 
-        if (!response.ok) return res.status(401).json({error: 'Invalid credentials'});
-
         const data = await response.json();
-        const {access_token, id_token, refresh_token, expires_in} = data;
+
+        if (data.error) {
+            console.error("Token exchange error:", data);
+            return res.status(400).json(data);
+        }
+
+        const { access_token, id_token, refresh_token, expires_in } = data;
+
         const decoded = jwt.decode(id_token);
 
-        const payload = {
-            ...decoded,
-            access_token,
-            refresh_token,
-        };
-
-        const jwe = await encryptToken(payload, '1h');
-
-        req.session.username = login;
-        req.session.access_token = jwe;
+        req.session.username = decoded.email || decoded.name || decoded.sub;
+        req.session.access_token = access_token;
         req.session.refresh_token = refresh_token;
         req.session.expires_at = Date.now() + expires_in * 1000;
         req.session.issued_at = Date.now();
 
         res.json({
-            message: 'Login successful',
+            message: 'Login successful via Auth0 SSO',
+            user: decoded,
             sessionId: req.sessionId,
-            username: login,
-            token: jwe,
+            token: access_token,
+            refresh_token
         });
 
-    } catch (error) {
-        console.error('Login error:', error);
-        res.status(500).json({error: 'Internal server error'});
+    } catch (err) {
+        console.error('Callback error:', err);
+        res.status(500).json({ error: 'Failed to exchange code' });
     }
 });
 
@@ -244,7 +290,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-app.get('/api/check-token', async (req, res) => {
+app.get('/api/check-token', checkJwe, async (req, res) => {
     const session = req.session;
 
     if (!session.access_token) {
